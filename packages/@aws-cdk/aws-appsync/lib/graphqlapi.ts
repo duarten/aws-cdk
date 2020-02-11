@@ -424,6 +424,10 @@ function concatAndDedup<T>(left: T[], right: T[]): T[] {
     });
 }
 
+function expressionName(keyName: string): string {
+    return `"#${keyName}" : "${keyName}"`;
+}
+
 /**
  * Utility class to represent DynamoDB key conditions.
  */
@@ -450,9 +454,7 @@ abstract class BaseKeyCondition {
 
     public renderExpressionNames(): string {
         return this.keyNames()
-            .map((keyName: string) => {
-                return `"#${keyName}" : "${keyName}"`;
-            })
+            .map(expressionName)
             .join(", ");
     }
 
@@ -612,6 +614,155 @@ export class KeyCondition {
 }
 
 /**
+ * Utility class representing the assigment of a value to an attribute.
+ */
+export class Assign {
+    constructor(private readonly attr: string, private readonly arg: string) { }
+
+    /**
+     * Renders the assignment as a VTL string.
+     */
+    public renderAsAssignment(): string {
+        return `"${this.attr}" : $util.dynamodb.toDynamoDBJson($ctx.args.${this.arg})`;
+    }
+
+    /**
+     * Renders the assignment as a map element.
+     */
+    public putInMap(map: string): string {
+        return `$util.qr($${map}.put("${this.attr}", "${this.arg}"))`;
+    }
+}
+
+/**
+ * Callback for Is, since JSII doesn't support free-floating functions.
+ */
+export interface IsStep<T> {
+    // tslint:disable-next-line:callable-types
+    (val: string): T
+}
+
+/**
+ * Utility class to allow assigning a value.
+ */
+export class Is<T> {
+    constructor(private readonly next: IsStep<T>) { }
+
+    /**
+     * Assign the value to the expecting callback.
+     */
+    public is(val: string): T {
+        return this.next(val);
+    }
+}
+
+/**
+ * Utility class to allow assigning a value or an auto-generated id.
+ */
+export class MaybeAuto<T> extends Is<T> {
+    /**
+     * Assign an auto-generated value to the expecting callback.
+     */
+   public auto(): T {
+       return this.is("$util.autoId()");
+   }
+}
+
+/**
+ * Specifies the assignment to the primary key. It can contain only the
+ * partition key it can contain the full primary key.
+ */
+export class PrimaryKey {
+    /**
+     * Allows assigning a value to the partition key.
+     */
+    public static partition(key: string): MaybeAuto<PartitionKey> {
+        return new MaybeAuto(val => new PartitionKey(new Assign(key, val)));
+    }
+
+    constructor(protected readonly pkey: Assign, private readonly skey?: Assign) { }
+
+    /**
+     * Renders the key assignment to a VTL string.
+     */
+    public renderTemplate(): string {
+        const assignments = [this.pkey.renderAsAssignment()];
+        if (this.skey) {
+            assignments.push(this.skey.renderAsAssignment());
+        }
+        return `"key" : {
+            ${assignments.join(",")}
+        }`;
+    }
+}
+
+/**
+ * Specifies the assignment to the partition key. It can enhanced
+ * with the assignment of the sort key.
+ */
+export class PartitionKey extends PrimaryKey {
+    constructor(key: Assign) {
+        super(key);
+    }
+
+    /**
+     * Allows assigning a value to the sort key.
+     */
+    public sort(key: string): MaybeAuto<PrimaryKey> {
+        return new MaybeAuto(val => new PrimaryKey(this.pkey, new Assign(key, val)));
+    }
+}
+
+/**
+ * Specifies the attribute value assignments.
+ */
+export class AttributeValues {
+    constructor(private readonly container: string, private readonly assignments: Assign[] = []) { }
+
+    /**
+     * Allows assigning a value to the specified attribute.
+     */
+    public attribute(attr: string): Is<AttributeValues> {
+        return new Is(val => {
+            this.assignments.push(new Assign(attr, val));
+            return this;
+        });
+    }
+
+    /**
+     * Renders the attribute value assingments to a VTL string.
+     */
+    public renderTemplate(): string {
+        return `
+            #set($input = ${this.container})
+            ${this.assignments.map(a => a.putInMap("input")).join("\n")}
+            "attributeValues": $util.dynamodb.toMapValuesJson($input)`;
+    }
+}
+
+/**
+ * Factory class for attribute value assignments.
+ */
+export class Values {
+    /**
+     * Treats the specified object as a map of assignments, where the property
+     * names represent attribute names. It’s opinionated about how it represents
+     * some of the nested objects: e.g., it will use lists (“L”) rather than sets
+     * (“SS”, “NS”, “BS”). By default it projects the argument container ("$ctx.args").
+     */
+    public static projecting(arg?: string): AttributeValues {
+        return new AttributeValues('$ctx.args' + arg ? `.${arg}` : '');
+    }
+
+    /**
+     * Allows assigning a value to the specified attribute.
+     */
+    public static attribute(attr: string): Is<AttributeValues> {
+        return new AttributeValues('{}').attribute(attr);
+    }
+}
+
+/**
  * MappingTemplates for AppSync resolvers
  */
 export abstract class MappingTemplate {
@@ -683,18 +834,15 @@ export abstract class MappingTemplate {
     /**
      * Mapping template to save a single item to a DynamoDB table
      *
-     * @param keyName the name of the hash key field
-     * @param valueArg the name of the Mutation argument to use as attributes. By default it uses all arguments
-     * @param idArg the name of the Mutation argument to use as id value. By default it generates a new id
+     * @param key the assigment of Mutation values to the primary key
+     * @param values the assignment of Mutation values to the table attributes
      */
-    public static dynamoDbPutItem(keyName: string, valueArg?: string, idArg?: string): MappingTemplate {
+    public static dynamoDbPutItem(key: PrimaryKey, values: AttributeValues): MappingTemplate {
         return this.fromString(`{
             "version" : "2017-02-28",
             "operation" : "PutItem",
-            "key" : {
-                "${keyName}": $util.dynamodb.toDynamoDBJson(${idArg ? `$ctx.args.${idArg}` : '$util.autoId()'}),
-            },
-            "attributeValues" : $util.dynamodb.toMapValuesJson(${valueArg ? `$ctx.args.${valueArg}` : '$ctx.args'})
+            ${key.renderTemplate()},
+            ${values.renderTemplate()}
         }`);
     }
 
